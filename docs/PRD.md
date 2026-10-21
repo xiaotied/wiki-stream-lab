@@ -5,7 +5,7 @@
 | **Owner** | @xiaotied |
 | **Status** | Draft — M0 scaffold in progress |
 | **Last updated** | 2026-10-20 |
-| **Technical design** | [`README.md`](../README.md) |
+| **Technical design** | [`TECHNICAL_DESIGN.md`](TECHNICAL_DESIGN.md) · **Tutorial** | [`README.md`](../README.md) |
 
 ---
 
@@ -64,7 +64,7 @@ A single learner: a software / data engineer comfortable with Python and SQL, ne
 |---|---|---|
 | FR1 | Consume `https://stream.wikimedia.org/v2/stream/recentchange` via SSE with a descriptive User-Agent | P0 |
 | FR2 | Drop Wikimedia `canary` events | P0 |
-| FR3 | Publish a trimmed, flat JSON record (contract in README §4.2) to `wiki.recentchange` | P0 |
+| FR3 | Publish a trimmed, flat JSON record (contract in TECHNICAL_DESIGN §4.2) to `wiki.recentchange` | P0 |
 | FR4 | Key messages by `wiki` | P0 |
 | FR5 | Reconnect automatically on stream errors, resuming via `Last-Event-ID` | P0 |
 | FR6 | Log throughput (events/s) every 10 s | P1 |
@@ -85,7 +85,7 @@ A single learner: a software / data engineer comfortable with Python and SQL, ne
 | FR11 | Flink SQL source table over `wiki.recentchange` with event-time column and bounded-out-of-orderness watermark | P0 |
 | FR12 | J1: edits per wiki per 1-minute tumbling window | P0 |
 | FR13 | J2: bot vs human edit ratio per minute | P1 |
-| FR14 | J3: top 5 pages per 10-minute window sliding every minute, sunk to an `upsert-kafka` topic | P0 |
+| FR14 | J3: top 5 pages per 10-minute window sliding every minute, sunk to Kafka. J3b: all-time top 10 sunk to an `upsert-kafka` topic | P0 |
 | FR15 | J4: spike detection (> N edits per page per minute), sunk to Kafka | P1 |
 | FR16 | J5: largest byte-size changes | P2 |
 | FR17 | Checkpointing can be enabled per job, with checkpoints on a persistent volume | P0 |
@@ -95,7 +95,7 @@ A single learner: a software / data engineer comfortable with Python and SQL, ne
 | ID | Requirement | Priority |
 |---|---|---|
 | FR18 | All SQL lives in `sql/` and is runnable from the SQL client without rebuilding images | P0 |
-| FR19 | README documents architecture, contracts, ops commands, experiments and troubleshooting | P0 |
+| FR19 | README tutorial teaches the stack step by step. TECHNICAL_DESIGN documents architecture, contracts, ops commands, experiments and troubleshooting | P0 |
 | FR20 | All image and dependency versions pinned | P0 |
 
 ## 8. Non-functional requirements
@@ -106,7 +106,7 @@ A single learner: a software / data engineer comfortable with Python and SQL, ne
 | NFR2 | Startup time | Events visible in Kafka ≤ 2 min after `up` (warm image cache) |
 | NFR3 | End-to-end latency | Raw event visible in Flink SQL ≤ 5 s after Wikimedia emits it. Window results emitted ≤ watermark delay + a few seconds after window end |
 | NFR4 | Recoverability | With checkpointing on, a TaskManager kill recovers without manual steps and without resetting window state |
-| NFR5 | Reproducibility | Fresh clone + README → working pipeline, no undocumented steps |
+| NFR5 | Reproducibility | Fresh clone + README tutorial → working pipeline, no undocumented steps |
 | NFR6 | Etiquette | Respect Wikimedia's User-Agent policy. Single connection, no aggressive reconnects (≥ 3 s backoff) |
 
 ## 9. Milestones & acceptance criteria
@@ -118,8 +118,8 @@ The core (M0–M3) is timeboxed to about 2 hours.
 | **M0 — Infra up** | 15 min | Docker Desktop installed. Compose stack builds and starts | `docker compose ps` shows all services up and Kafka healthy. Flink UI and Kafka UI load |
 | **M1 — Ingestion** | 20 min | Producer streaming into Kafka | Producer logs ≥ 10 events/s. Messages visible in Kafka UI across 3 partitions. Keys = wiki names |
 | **M2 — First Flink job** | 25 min | `sql/01_source.sql`, J1, J2 | `SELECT` on source shows live rows. J1 emits one row per wiki per minute, with watermark visible in Flink UI |
-| **M3 — Stateful jobs** | 30 min | J3 (+ upsert-kafka sink), J4 | `wiki.top_pages_10m` and `wiki.edit_spikes` receive records. Consuming the upsert topic shows updates per key |
-| **M4 — Break it** | 15 min | Failure experiments (README §10) | Each experiment run with a one-line observation recorded in the README |
+| **M3 — Stateful jobs** | 30 min | J3 (+ upsert-kafka sink), J4 | `wiki.top_pages_10m`, `wiki.top_pages_live` and `wiki.edit_spikes` receive records. Consuming `wiki.top_pages_live` shows repeated updates per rank key |
+| **M4 — Break it** | 15 min | Failure experiments (TECHNICAL_DESIGN §10) | Each experiment run, with a one-line observation recorded in TECHNICAL_DESIGN §10 |
 | **M5 — Stretch** | open | Persist Last-Event-ID, dedup, Avro + Schema Registry, dashboard, Java DataStream port | Each item merged with docs |
 
 ## 10. Success metrics (learning outcomes)
