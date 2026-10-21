@@ -4,7 +4,7 @@
 
 This README is a **hands-on tutorial**. Work through the labs in order. Each one introduces a few concepts, has you run real commands, and ends with questions to check you understood. Reference material (exact configs, data contracts, design decisions) is in [`docs/TECHNICAL_DESIGN.md`](docs/TECHNICAL_DESIGN.md). Goals and phases are in [`docs/PRD.md`](docs/PRD.md).
 
-> **Status:** Phase 1. The stack hasn't been run end to end yet. If a command doesn't behave as described, that's a bug in the lab, so please fix it or open an issue.
+> **Status:** Phase 1, verified end to end on 2026-10-20 (Docker Desktop 4.96, Apple Silicon). If a command doesn't behave as described, that's a bug in the lab, so please fix it or open an issue.
 
 ---
 
@@ -92,9 +92,10 @@ $ docker compose version  # Compose v2 is built in
 
 ### 0.2 Start the downloads now
 
-The first build downloads ~1.5 GB of images. Run these in a second terminal and continue with the basics while they finish:
+The first build downloads ~1.5 GB of images. Run these in a second terminal and continue with the basics while they finish. Compose commands must run **from the repo folder**, because that's where it looks for `docker-compose.yml` (otherwise: `no configuration file provided`).
 
 ```sh
+$ cd ~/wiki-stream-lab                   # wherever you cloned it
 $ docker compose pull kafka kafka-ui     # pre-fetch published images
 $ docker compose build                   # build our two images (producer, flink)
 ```
@@ -201,7 +202,9 @@ Open [`producer/producer.py`](producer/producer.py):
 - `stream_events()` reads SSE lines and remembers the last `id`, so it can **resume** after a disconnect (`Last-Event-ID`).
 - `trim()` flattens each big upstream event into ~12 fields. This is the **data contract** ([TECHNICAL_DESIGN §4.2](docs/TECHNICAL_DESIGN.md#42-topic-wikirecentchange-raw)).
 - `producer.produce(..., key=event["wiki"])` is the key choice you just saw in Kafka UI.
-- Config: `acks=all` (wait for a durable write), `linger.ms=50` (batch messages for 50 ms), `compression.type=lz4`.
+- Config: `acks=all` (wait for a durable write), `linger.ms=50` (batch messages for 50 ms), `compression.type=lz4`, and `partitioner=murmur2_random`.
+
+💡 **Real gotcha found while building this lab:** the Python client (librdkafka) hashes keys with CRC32 by default, while Java clients, including Flink, use murmur2. Without `partitioner=murmur2_random`, `commonswiki` landed on partition 0 in the raw topic and partition 2 in Flink's output topic. "Same key → same partition" only holds when every client uses the same hash function.
 
 Then look at [`producer/Dockerfile`](producer/Dockerfile): base image → install deps → copy code → command. `requirements.txt` is copied *before* the code, so editing `producer.py` reuses the cached `pip install` layer.
 
@@ -384,6 +387,8 @@ WHERE `type` IN ('edit', 'new');
 2. **Kafka UI** → Topics → `wiki.edits.clean` → Messages: cleaned records with `event_ts`, `user_name`, `byte_delta`, keyed by wiki.
 3. **Kafka UI** → Consumers → `flink-wiki`: the job's committed offsets and lag on `wiki.recentchange`.
 
+✅ Lag shows a few hundred messages and drops after each checkpoint. That's expected: Flink commits offsets **only on checkpoints** (every 30 s), so the committed position trails the real one by up to 30 s of data (~800 events). The consumer-groups CLI also shows no `CONSUMER-ID`, because Flink assigns partitions itself instead of joining the group like a normal consumer. The group is only used to store offsets.
+
 From the CLI:
 
 ```sh
@@ -396,11 +401,17 @@ $ docker compose exec jobmanager ./bin/flink list
 
 ### 3.5 Save your SQL (optional)
 
-Put the `CREATE TABLE recentchange …` statement in `sql/01_source.sql`, and the rest of this lab in `sql/02_clean_edits.sql`. Next time:
+The statements from this tutorial are already saved in [`sql/01_source.sql`](sql/01_source.sql) and [`sql/02_clean_edits.sql`](sql/02_clean_edits.sql). Next time:
 
 ```sh
+# interactive session with the source table preloaded
 $ docker compose exec jobmanager ./bin/sql-client.sh -i /opt/sql/01_source.sql
+
+# or submit the whole job non-interactively
+$ docker compose exec jobmanager ./bin/sql-client.sh -i /opt/sql/01_source.sql -f /opt/sql/02_clean_edits.sql
 ```
+
+⚠️ In SQL files, put comments on their own line. The client only ends a statement at a `;` that ends the line, so `SET ...;  -- comment` merges with the next statement and fails with `only single statement supported`.
 
 (`./sql` on your Mac is bind-mounted to `/opt/sql` in the container, so there's no rebuild.)
 

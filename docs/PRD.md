@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Owner** | @xiaotied |
-| **Status** | Phase 1 in progress |
+| **Status** | Phase 1 complete (verified 2026-10-20) |
 | **Last updated** | 2026-10-20 |
 | **Technical design** | [`TECHNICAL_DESIGN.md`](TECHNICAL_DESIGN.md) · **Tutorial** | [`README.md`](../README.md) |
 

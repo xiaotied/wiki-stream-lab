@@ -19,6 +19,9 @@ producer = Producer({
     "acks": "all",
     "linger.ms": 50,            # batch small messages for throughput
     "compression.type": "lz4",
+    # librdkafka defaults to CRC32 key hashing; Java clients (incl. Flink) use murmur2.
+    # Match them so a key lands on the same partition number in every topic.
+    "partitioner": "murmur2_random",
 })
 
 
