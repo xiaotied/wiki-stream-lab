@@ -146,6 +146,10 @@ wiki-stream-lab/
 │   ├── requirements.txt
 │   └── producer.py           # SSE → Kafka
 ├── sql/                      # Flink SQL scripts; bind-mounted to /opt/sql in the JobManager
+│   ├── 01_source.sql         # raw source table `recentchange`
+│   ├── 02_clean_edits.sql    # job clean_edits: raw → wiki.edits.clean
+│   └── 03_clean_source.sql   # read-side table `edits_clean_read` for ad-hoc queries
+├── sql-shell.sh              # opens the SQL client with several sql/ files preloaded
 ├── docs/
 │   ├── PRD.md                # product requirements and phases
 │   └── TECHNICAL_DESIGN.md   # this document
@@ -355,6 +359,7 @@ Design notes:
 - **Ad-hoc queries** (`SELECT … FROM recentchange`) run in the SQL client session and stop when you cancel them. `INSERT INTO` submits a detached job that keeps running in the cluster.
 - **Loading files:** `-i <file>` runs DDL at startup, and `-f <file>` executes a script and exits (used to submit the job: `./bin/sql-client.sh -i /opt/sql/01_source.sql -f /opt/sql/02_clean_edits.sql`). The SQL client has no `SOURCE` command.
 - **Statement splitting:** the client only ends a statement at a `;` that ends the line. A trailing comment after `;` merges two statements (`only single statement supported`), so comments go on their own lines.
+- **Ad-hoc querying:** `sql/03_clean_source.sql` defines `edits_clean_read` with its own group (`adhoc-query`) and `earliest-offset`, so queries never move the job's committed offsets. Bounded queries add `/*+ OPTIONS('scan.bounded.mode'='latest-offset') */` and run with `SET 'execution.runtime-mode' = 'batch';` to return final results. `sql-client.sh` accepts a single `-i`, so `sql-shell.sh` concatenates files inside the container.
 - **Consumer group semantics:** Flink assigns partitions itself and uses `flink-wiki` only to store committed offsets. The group shows no members (`CONSUMER-ID -`), and lag only moves on checkpoints.
 
 ### 6.4 Observed on first run (2026-10-20)
@@ -415,6 +420,8 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-s
 docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group flink-wiki
 
 # Flink
+./sql-shell.sh                                   # SQL client with recentchange + edits_clean_read
+./sql-shell.sh 01_source.sql -f /opt/sql/02_clean_edits.sql   # (re)submit the clean_edits job
 docker compose exec jobmanager ./bin/sql-client.sh
 docker compose exec jobmanager ./bin/sql-client.sh -i /opt/sql/01_source.sql
 docker compose exec jobmanager ./bin/flink list

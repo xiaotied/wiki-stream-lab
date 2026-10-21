@@ -46,6 +46,7 @@ By the end you'll be able to:
 | [1](#lab-1--start-the-stack-and-see-the-data) | Start the stack & see the data | 15 min | Compose up, the producer, topics, partitions, keys |
 | [2](#lab-2--query-the-live-stream-with-flink-sql) | Query the live stream with Flink SQL | 15 min | dynamic tables, JobManager/TaskManager, append vs update |
 | [3](#lab-3--your-first-pipeline-job) | Your first pipeline job | 10 min | source → transform → sink, detached jobs, consumer groups |
+| [3b](#lab-3b--query-the-raw-and-clean-data) | Query the raw and clean data | 10 min | Kafka UI, CLI + jq, streaming vs bounded SQL queries |
 | [4](#lab-4--clean-up) | Clean up | 2 min | teardown |
 
 Sections marked **(optional)** deepen understanding but aren't required to finish within 60 minutes.
@@ -424,6 +425,98 @@ $ docker compose exec jobmanager ./bin/sql-client.sh -i /opt/sql/01_source.sql -
 4. Why does consumer group `flink-wiki` only show offsets after checkpointing is enabled?
 
 🏋️ **Challenge (optional):** cancel the job (`./bin/flink cancel <job-id>`), add a filter that drops Wikidata bot edits (`NOT (wiki = 'wikidatawiki' AND bot)`), and resubmit. Compare message rates in Kafka UI.
+
+---
+
+## Lab 3b — Query the raw and clean data
+
+**Goal:** ask questions of both topics. There are three ways to do it, depending on how much power you need.
+
+### Option 1: Kafka UI (browse)
+
+http://localhost:8080 → Topics → `wiki.recentchange` or `wiki.edits.clean` → **Messages**. Pick a partition, seek to an offset or timestamp, or filter (e.g. *contains* `enwiki`). Good for eyeballing records. You can't aggregate here.
+
+### Option 2: Kafka CLI + `jq` (quick filters from your terminal)
+
+```sh
+# 5 latest raw events
+$ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+    --topic wiki.recentchange --max-messages 5
+
+# human English Wikipedia edits from the clean topic, selected fields
+$ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+    --topic wiki.edits.clean --max-messages 200 \
+  | jq -c 'select(.wiki=="enwiki" and (.is_bot|not)) | {event_ts, title, user_name, byte_delta}'
+```
+
+Add `--from-beginning` to read from the oldest retained message (up to 24 h) instead of new ones only.
+
+### Option 3: Flink SQL (real queries)
+
+```sh
+$ ./sql-shell.sh
+```
+
+[`sql-shell.sh`](sql-shell.sh) opens the SQL client with two tables preloaded:
+
+| Table | Topic | Reads from |
+|---|---|---|
+| `recentchange` | `wiki.recentchange` (raw) | new messages only (`latest-offset`) |
+| `edits_clean_read` | `wiki.edits.clean` (clean) | the beginning of the topic (`earliest-offset`) |
+
+(`sql-client.sh` accepts only one `-i` file, so the wrapper concatenates [`sql/01_source.sql`](sql/01_source.sql) and [`sql/03_clean_source.sql`](sql/03_clean_source.sql) inside the container.)
+
+```sql
+Flink SQL> SET 'sql-client.execution.result-mode' = 'tableau';
+```
+
+**Streaming queries** never finish. Results keep updating until you press `Ctrl-C`:
+
+```sql
+-- live raw events
+Flink SQL> SELECT event_ts, wiki, `type`, title FROM recentchange;
+
+-- live human edits on English Wikipedia from the clean topic
+Flink SQL> SELECT event_ts, title, user_name, byte_delta
+           FROM edits_clean_read WHERE wiki = 'enwiki' AND NOT is_bot;
+```
+
+**Bounded queries** read up to "now", then stop and return a final answer, like a normal database query. Two settings make that happen:
+
+```sql
+Flink SQL> SET 'execution.runtime-mode' = 'batch';
+
+-- busiest wikis in the clean topic so far, with bot share
+Flink SQL> SELECT wiki, COUNT(*) AS edits, SUM(CASE WHEN is_bot THEN 1 ELSE 0 END) AS bot_edits
+           FROM edits_clean_read /*+ OPTIONS('scan.bounded.mode'='latest-offset') */
+           GROUP BY wiki ORDER BY edits DESC LIMIT 10;
+
+-- biggest human additions on enwiki
+Flink SQL> SELECT event_ts, title, user_name, byte_delta
+           FROM edits_clean_read /*+ OPTIONS('scan.bounded.mode'='latest-offset') */
+           WHERE wiki = 'enwiki' AND NOT is_bot
+           ORDER BY byte_delta DESC LIMIT 10;
+
+-- event types in the RAW topic (override its startup mode and group just for this query)
+Flink SQL> SELECT `type`, COUNT(*) AS n
+           FROM recentchange /*+ OPTIONS('scan.startup.mode'='earliest-offset',
+                                         'scan.bounded.mode'='latest-offset',
+                                         'properties.group.id'='adhoc-query') */
+           GROUP BY `type`;
+
+Flink SQL> SET 'execution.runtime-mode' = 'streaming';   -- back to live mode
+```
+
+💡 **Same SQL, two modes.** `scan.bounded.mode = latest-offset` tells the Kafka source to stop at the offsets that exist when the query starts, which makes the input *finite*. In **batch** mode Flink then computes the final result once, instead of streaming `+I/-U/+U` updates. `ORDER BY` on a non-time column and `LIMIT` are natural here. The `/*+ OPTIONS(...) */` **hint** overrides table options for one query without changing the table definition.
+
+💡 **Why does the clean table have its own `group.id` (`adhoc-query`)?** Offsets are stored per consumer group. Ad-hoc queries use a separate group so they never move the committed offsets of the `clean_edits` job (`flink-wiki`).
+
+✅ Example from the first run: `commonswiki` was the busiest wiki in the clean topic (9,330 edits, about half by bots), ahead of `enwiki` (3,186). In the raw topic, `categorize` events (29,567) outnumbered `edit` (19,165).
+
+🧠 **Check yourself**
+1. Why does the `GROUP BY` query return a final table in batch mode, but `-U/+U` updates in streaming mode?
+2. What would go wrong if the ad-hoc table used `properties.group.id = 'flink-wiki'`?
+3. These queries scan Kafka every time and only see 24 h of data. What does that tell you about using Kafka as your analytics store? (This is what phase 2 fixes.)
 
 ---
 
