@@ -399,6 +399,8 @@ $ docker compose exec jobmanager ./bin/flink list
 
 💡 **You just built a pipeline stage.** Raw topic → stateless transform → clean topic is the most common streaming pattern. Downstream systems now consume a stable, cleaned contract ([TECHNICAL_DESIGN §4.3](docs/TECHNICAL_DESIGN.md#43-topic-wikieditsclean-flink-output)) instead of raw upstream data. In phase 2, an Iceberg sink will read from `wiki.edits.clean`.
 
+💡 **Stream vs batch transformation.** Transforming in Flink isn't the only option. Many teams land raw Kafka data in a data lake and clean it later with batch tools (Glue, Spark, dbt): simpler and cheaper, but minutes to hours stale. Streaming transforms like this one are used where seconds matter, and most companies run both. See [TECHNICAL_DESIGN: Where to transform](docs/TECHNICAL_DESIGN.md#where-to-transform-two-industry-patterns).
+
 ### 3.5 Save your SQL (optional)
 
 The statements from this tutorial are already saved in [`sql/01_source.sql`](sql/01_source.sql) and [`sql/02_clean_edits.sql`](sql/02_clean_edits.sql). Next time:
@@ -416,9 +418,10 @@ $ docker compose exec jobmanager ./bin/sql-client.sh -i /opt/sql/01_source.sql -
 (`./sql` on your Mac is bind-mounted to `/opt/sql` in the container, so there's no rebuild.)
 
 🧠 **Check yourself**
-1. Why did `INSERT INTO` return immediately while `SELECT` kept your terminal busy?
-2. What would happen to `wiki.edits.clean` if you stopped the producer? And if you cancelled the job?
-3. Why does consumer group `flink-wiki` only show offsets after checkpointing is enabled?
+1. Why keep both a raw and a clean topic, instead of cleaning inside the producer?
+2. Why did `INSERT INTO` return immediately while `SELECT` kept your terminal busy?
+3. What would happen to `wiki.edits.clean` if you stopped the producer? And if you cancelled the job?
+4. Why does consumer group `flink-wiki` only show offsets after checkpointing is enabled?
 
 🏋️ **Challenge (optional):** cancel the job (`./bin/flink cancel <job-id>`), add a filter that drops Wikidata bot edits (`NOT (wiki = 'wikidatawiki' AND bot)`), and resubmit. Compare message rates in Kafka UI.
 

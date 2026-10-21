@@ -8,7 +8,7 @@ Laptop-scale real-time pipeline: **live Wikipedia edits → Apache Kafka → Apa
 
 ## Contents
 
-1. [Architecture](#1-architecture)
+1. [Architecture](#1-architecture) (incl. why two topics, and batch vs stream transformation)
 2. [Components & versions](#2-components--versions)
 3. [Repository layout](#3-repository-layout)
 4. [Data contracts](#4-data-contracts)
@@ -65,6 +65,54 @@ producer → wiki.recentchange → [clean_edits] → wiki.edits.clean ─┬─�
 ```
 
 Keeping `wiki.edits.clean` as a stable intermediate topic means later phases add consumers without touching ingestion.
+
+### Why two topics
+
+Each topic is the output of one pipeline stage:
+
+| Topic | Layer | Holds |
+|---|---|---|
+| `wiki.recentchange` | raw (≈ bronze) | Everything the source sent, minimally trimmed, nothing dropped |
+| `wiki.edits.clean` | cleaned (≈ silver) | Only `edit`/`new`, typed and renamed fields, derived `byte_delta` |
+
+Reasons to keep them separate:
+
+- **Replay:** if the cleaning logic is wrong, or you later need dropped events, fix the job and reprocess from the raw topic (within its 24 h retention). Cleaning inside the producer would lose that data for good.
+- **Stable contract:** downstream readers depend on `wiki.edits.clean`, not on Wikimedia's format. Upstream changes are absorbed in one place (`clean_edits`).
+- **Separation of concerns:** the producer only ingests and Flink only transforms. Each can change, restart or scale independently.
+- **Fan-out:** many consumers read the cleaned topic, each with its own offsets, instead of each repeating the same cleanup.
+
+Cost: the data is stored twice, plus one extra hop of latency (milliseconds) and one more running component.
+
+### Where to transform: two industry patterns
+
+There are two common places to turn raw events into clean data. This project uses **B**, because the goal is to learn Flink. **A** is just as valid and often the default.
+
+**A. Land raw, transform in the lake (ELT)**
+
+```
+Kafka (raw) ──▶ object storage, raw/bronze ──▶ batch ETL (Glue, Spark, dbt), hourly or daily ──▶ silver / gold tables
+               (Kafka Connect S3 sink, Firehose, or Flink)
+```
+
+**B. Transform in the stream**
+
+```
+Kafka (raw) ──▶ Flink ──▶ Kafka (clean) ──▶ lake, applications, alerts
+```
+
+| | A: transform in the lake | B: transform in the stream |
+|---|---|---|
+| Freshness of clean data | Minutes to hours (batch schedule) | Seconds |
+| Typical tools | Kafka Connect / Firehose + Glue, Spark, dbt | Flink, Kafka Streams |
+| Skills | Batch SQL / Spark: familiar to most data teams | Streaming: state, checkpoints, event time |
+| Reprocessing | Rerun a batch over raw files, kept for years | Replay from Kafka, only within retention |
+| Cost / operations | Cheaper: jobs run and stop | Always-on cluster |
+| Best for | Analytics, BI, ML training | Fraud detection, alerting, live metrics, feeding operational systems |
+
+**In practice, most companies combine them.** Raw data always lands in the lake as the long-term source of truth. Batch ETL builds analytical tables wherever hourly or daily freshness is enough, which is most cases. Stream processing is reserved for the paths where seconds matter. Rule of thumb: **use batch unless you need it real-time.**
+
+How this maps to the roadmap: phase 1 implements B up to the clean topic. Phase 2 lands data in Iceberg, which is where A's raw layer would live if the project adopts it.
 
 ---
 
