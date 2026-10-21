@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Owner** | @xiaotied |
-| **Status** | Draft — M0 scaffold in progress |
+| **Status** | Phase 1 in progress |
 | **Last updated** | 2026-10-20 |
 | **Technical design** | [`TECHNICAL_DESIGN.md`](TECHNICAL_DESIGN.md) · **Tutorial** | [`README.md`](../README.md) |
 
@@ -11,141 +11,134 @@
 
 ## 1. Summary
 
-Build a small but real streaming pipeline that ingests live Wikipedia edits into Kafka and analyzes them with Flink, running fully in Docker on a laptop. The product is **hands-on experience**: by the end, the owner should be able to explain and demonstrate the core mechanics of Kafka, Flink and Docker Compose from things they built and broke themselves.
+Build a small but real streaming pipeline that ingests live Wikipedia edits into Kafka and processes them with Flink, running fully in Docker on a laptop. The product is **hands-on experience**: the owner learns Kafka, Flink and Docker from things they built and broke themselves.
+
+The work is split into three phases. **Phase 1 (today, ≤ 60 min)** gets data flowing end to end and visible live. Storage (Iceberg) and analytics (windows, Top-N) come later.
 
 ## 2. Problem & motivation
 
-Kafka and Flink are easy to read about and hard to *feel*. Tutorials often use synthetic data generators, hide configuration behind managed services, or stop at "hello world". This lab uses:
+Kafka and Flink are easy to read about and hard to *feel*. Tutorials often use synthetic data, hide configuration behind managed services, or stop at "hello world". This lab uses:
 
-- **Real, continuous, free data** (Wikimedia EventStreams), with enough volume (~20–50 events/s) and enough shape (skewed keys, bots, bursts, out-of-order timestamps) to make streaming concepts matter.
-- **Explicit, local infrastructure** so every concept (listeners, partitions, watermarks, checkpoints, volumes) is a line of config you can change.
-- **A tight timebox** (~2 hours for the core) so it gets finished.
+- **Real, continuous, free data** (Wikimedia EventStreams, ~20–50 events/s) with real-world shape: skewed keys, bots, bursts, out-of-order timestamps.
+- **Explicit local infrastructure**, so every concept (listeners, partitions, consumer groups, jobs, volumes) is a line of config you can change.
+- **Small phases**, each of which ends with something working.
 
 ## 3. Target user
 
-A single learner: a software / data engineer comfortable with Python and SQL, new to Kafka, Flink and Docker, working on a 16 GB macOS laptop.
+A single learner: a software / data engineer comfortable with Python and SQL, new to Kafka, Flink and Docker, working on a 16 GB macOS laptop with limited time per session.
 
-## 4. Goals
+## 4. Phases
+
+| Phase | Theme | Outcome | Timebox |
+|---|---|---|---|
+| **1 — Live pipeline** | Ingest + stream processing | Edits flow Wikipedia → Kafka → Flink. Visible live in Kafka UI and the Flink SQL client. A Flink job publishes a cleaned topic | **≤ 60 min** |
+| **2 — Lakehouse** | Durable analytical storage | Flink writes the cleaned stream to an **Apache Iceberg** table. DuckDB queries it | ~2 h |
+| **3 — Real-time analytics** | Time & state | Event-time windows, watermarks, Top-N, spike detection, checkpoint/failure experiments | ~2 h |
+
+## 5. Phase 1 scope
+
+### 5.1 Goals
 
 | ID | Goal |
 |---|---|
-| G1 | Run a complete pipeline with **one command** (`docker compose up -d --build`) |
-| G2 | Learn Kafka fundamentals: topics, partitions, keys, producer configs, consumer groups, offsets, listeners |
-| G3 | Learn Flink fundamentals: dynamic tables, event time, watermarks, tumbling/sliding windows, Top-N, state, changelog vs append, checkpoints and recovery |
-| G4 | Learn Docker fundamentals: images and Dockerfiles, Compose services, networking/DNS, port publishing, volumes vs bind mounts, healthchecks, logs/exec |
-| G5 | Produce a repo that is reproducible by someone else from the README alone |
+| G1 | Start the full stack with **one command** (`docker compose up -d --build`) |
+| G2 | See real Wikipedia edits arriving in Kafka (Kafka UI + CLI) |
+| G3 | Query the live stream with Flink SQL and watch results update |
+| G4 | Run one long-lived Flink job that transforms the raw topic into a cleaned topic |
+| G5 | Learn the Docker, Kafka and Flink basics needed for all of the above |
 
-## 5. Non-goals
+### 5.2 Non-goals (phase 1)
 
-- Production readiness (HA, security, multi-broker, SLAs, monitoring stack)
-- Cloud deployment or Kubernetes
-- Exactly-once end-to-end guarantees
-- A polished UI (a minimal dashboard is a stretch goal only)
-- Long-term storage or a data lake/warehouse sink
+- Persisting data outside Kafka (database, files, lake) → phase 2
+- Windows, watermarks, aggregations over time, Top-N, alerting → phase 3
+- Failure and recovery experiments → phase 3
+- Deduplication, schemas (Avro / Schema Registry) → phase 2+
+- Production readiness: HA, security, multi-broker, monitoring. Out of scope for all phases
 
-## 6. User stories
+### 5.3 User stories
 
 | ID | As the learner, I want to… | So that… |
 |---|---|---|
-| US1 | start everything with one command and see events flowing within 2 minutes | setup friction doesn't eat the session |
-| US2 | browse raw events in a UI and with CLI tools | I can see what partitions, keys and offsets look like |
-| US3 | query the live stream with SQL | I get results fast without a build loop |
-| US4 | see edits per wiki per minute computed on event time | I understand windows and watermarks |
-| US5 | see the top edited pages in a sliding window, written back to Kafka | I understand stateful Top-N and upsert/changelog streams |
-| US6 | get alerted when a page is edited abnormally often | I build a simple real-time detection use case |
-| US7 | kill components and watch the system recover (or not) | I understand checkpoints, offsets and failure semantics |
-| US8 | tear everything down and start fresh | experiments are cheap and repeatable |
+| US1 | start everything with one command and see events within 2 minutes | setup friction doesn't eat the session |
+| US2 | browse raw events in Kafka UI and with CLI tools | I see what topics, partitions, keys and offsets look like |
+| US3 | run a SQL query on the live stream and watch rows appear | I understand that Flink tables are views over unbounded streams |
+| US4 | submit a job that writes a cleaned topic and see it running in the Flink UI | I understand a pipeline stage: source → transform → sink |
+| US5 | stop and restart everything cheaply | experiments are repeatable |
 
-## 7. Functional requirements
-
-### 7.1 Ingestion
+### 5.4 Functional requirements
 
 | ID | Requirement | Priority |
 |---|---|---|
 | FR1 | Consume `https://stream.wikimedia.org/v2/stream/recentchange` via SSE with a descriptive User-Agent | P0 |
 | FR2 | Drop Wikimedia `canary` events | P0 |
-| FR3 | Publish a trimmed, flat JSON record (contract in TECHNICAL_DESIGN §4.2) to `wiki.recentchange` | P0 |
-| FR4 | Key messages by `wiki` | P0 |
-| FR5 | Reconnect automatically on stream errors, resuming via `Last-Event-ID` | P0 |
-| FR6 | Log throughput (events/s) every 10 s | P1 |
-| FR7 | Persist `Last-Event-ID` across producer restarts | P2 |
+| FR3 | Publish a trimmed, flat JSON record to `wiki.recentchange`, keyed by `wiki` (contract: TECHNICAL_DESIGN §4.2) | P0 |
+| FR4 | Reconnect automatically on stream errors, resuming via `Last-Event-ID` | P0 |
+| FR5 | Log producer throughput every 10 s | P1 |
+| FR6 | Single-node Kafka (KRaft) reachable from containers and from the host | P0 |
+| FR7 | Kafka UI for topics, messages and consumer groups | P0 |
+| FR8 | Flink SQL source table over `wiki.recentchange` with a parsed timestamp column | P0 |
+| FR9 | Flink job `clean_edits`: keep `edit` / `new` events, convert types, compute `byte_delta`, write to `wiki.edits.clean` keyed by `wiki` (contract: TECHNICAL_DESIGN §4.3) | P0 |
+| FR10 | Checkpointing enabled for the job so Kafka consumer offsets are committed and lag is visible | P1 |
+| FR11 | SQL saved in `sql/`, runnable via the SQL client without rebuilding images | P1 |
+| FR12 | All image and dependency versions pinned | P0 |
 
-### 7.2 Messaging
-
-| ID | Requirement | Priority |
-|---|---|---|
-| FR8 | Single-node Kafka in KRaft mode, reachable from containers and from the host | P0 |
-| FR9 | Source topic with 3 partitions and 24 h retention | P0 |
-| FR10 | Web UI for topics, messages and consumer groups | P1 |
-
-### 7.3 Processing
-
-| ID | Requirement | Priority |
-|---|---|---|
-| FR11 | Flink SQL source table over `wiki.recentchange` with event-time column and bounded-out-of-orderness watermark | P0 |
-| FR12 | J1: edits per wiki per 1-minute tumbling window | P0 |
-| FR13 | J2: bot vs human edit ratio per minute | P1 |
-| FR14 | J3: top 5 pages per 10-minute window sliding every minute, sunk to Kafka. J3b: all-time top 10 sunk to an `upsert-kafka` topic | P0 |
-| FR15 | J4: spike detection (> N edits per page per minute), sunk to Kafka | P1 |
-| FR16 | J5: largest byte-size changes | P2 |
-| FR17 | Checkpointing can be enabled per job, with checkpoints on a persistent volume | P0 |
-
-### 7.4 Developer experience
-
-| ID | Requirement | Priority |
-|---|---|---|
-| FR18 | All SQL lives in `sql/` and is runnable from the SQL client without rebuilding images | P0 |
-| FR19 | README tutorial teaches the stack step by step. TECHNICAL_DESIGN documents architecture, contracts, ops commands, experiments and troubleshooting | P0 |
-| FR20 | All image and dependency versions pinned | P0 |
-
-## 8. Non-functional requirements
+### 5.5 Non-functional requirements
 
 | ID | Requirement | Target |
 |---|---|---|
-| NFR1 | Resource footprint | ≤ 6 GB RAM total in Docker; runs on a 16 GB laptop alongside normal work |
+| NFR1 | Resource footprint | ≤ 6 GB RAM in Docker on a 16 GB laptop |
 | NFR2 | Startup time | Events visible in Kafka ≤ 2 min after `up` (warm image cache) |
-| NFR3 | End-to-end latency | Raw event visible in Flink SQL ≤ 5 s after Wikimedia emits it. Window results emitted ≤ watermark delay + a few seconds after window end |
-| NFR4 | Recoverability | With checkpointing on, a TaskManager kill recovers without manual steps and without resetting window state |
-| NFR5 | Reproducibility | Fresh clone + README tutorial → working pipeline, no undocumented steps |
-| NFR6 | Etiquette | Respect Wikimedia's User-Agent policy. Single connection, no aggressive reconnects (≥ 3 s backoff) |
+| NFR3 | Latency | Raw event visible in Flink SQL and in `wiki.edits.clean` ≤ 5 s after Wikimedia emits it |
+| NFR4 | Setup time | Fresh machine → G1–G4 done in ≤ 60 min, including installing Docker and downloading images |
+| NFR5 | Reproducibility | Fresh clone + README → working pipeline, no undocumented steps |
+| NFR6 | Etiquette | Respect Wikimedia's User-Agent policy. Single connection, ≥ 3 s reconnect backoff |
 
-## 9. Milestones & acceptance criteria
+### 5.6 Milestones & acceptance criteria
 
-The core (M0–M3) is timeboxed to about 2 hours.
+| Milestone | Timebox | Done when |
+|---|---|---|
+| **M0 — Infra up** | 25 min | Docker Desktop running. `docker compose ps` shows all services up and Kafka `healthy`. Kafka UI (`:8080`) and Flink UI (`:8081`) load |
+| **M1 — Ingestion** | 5 min | Producer logs ≥ 10 events/s. Kafka UI shows messages in `wiki.recentchange` across 3 partitions, keyed by wiki name |
+| **M2 — Live query** | 10 min | `SELECT` on the source table in the SQL client prints live rows |
+| **M3 — Pipeline job** | 10 min | `clean_edits` is RUNNING in the Flink UI. `wiki.edits.clean` receives records matching the contract. Consumer group `flink-wiki` shows lag in Kafka UI |
+| **M4 — Docs reconciled** | 5 min | README / TECHNICAL_DESIGN corrected for anything that behaved differently on the real run |
 
-| Milestone | Timebox | Scope | Done when |
-|---|---|---|---|
-| **M0 — Infra up** | 15 min | Docker Desktop installed. Compose stack builds and starts | `docker compose ps` shows all services up and Kafka healthy. Flink UI and Kafka UI load |
-| **M1 — Ingestion** | 20 min | Producer streaming into Kafka | Producer logs ≥ 10 events/s. Messages visible in Kafka UI across 3 partitions. Keys = wiki names |
-| **M2 — First Flink job** | 25 min | `sql/01_source.sql`, J1, J2 | `SELECT` on source shows live rows. J1 emits one row per wiki per minute, with watermark visible in Flink UI |
-| **M3 — Stateful jobs** | 30 min | J3 (+ upsert-kafka sink), J4 | `wiki.top_pages_10m`, `wiki.top_pages_live` and `wiki.edit_spikes` receive records. Consuming `wiki.top_pages_live` shows repeated updates per rank key |
-| **M4 — Break it** | 15 min | Failure experiments (TECHNICAL_DESIGN §10) | Each experiment run, with a one-line observation recorded in TECHNICAL_DESIGN §10 |
-| **M5 — Stretch** | open | Persist Last-Event-ID, dedup, Avro + Schema Registry, dashboard, Java DataStream port | Each item merged with docs |
+### 5.7 Success criteria (learning outcomes)
 
-## 10. Success metrics (learning outcomes)
+At the end of phase 1 the owner can, without notes:
 
-At the end, the owner can, without notes:
+1. Explain the difference between an image, a container and a volume, and how Compose services find each other.
+2. Explain topics, partitions, keys, offsets and consumer groups, and point to each in Kafka UI.
+3. Explain why Kafka in Docker advertises two listeners.
+4. Explain what a Flink `CREATE TABLE` over Kafka is (metadata, not storage) and the difference between an interactive `SELECT` and a submitted `INSERT INTO` job.
 
-1. Explain why Kafka needs both an internal and an external advertised listener in Docker.
-2. Explain how a message key maps to a partition, and show the skew it causes here.
-3. Explain the difference between event time and processing time, and what a watermark of `ts - 5s` means for late data.
-4. Explain why a Top-N query produces a changelog (updates/retractions) and why it needs an upsert sink.
-5. Demonstrate the difference in recovery behavior with and without checkpointing.
-6. Write a `docker-compose.yml` service with a build, ports, volume, healthcheck and dependency from memory.
+## 6. Later phases (outline)
 
-## 11. Risks & mitigations
+### Phase 2 — Lakehouse with Iceberg
+- Flink → **Iceberg** table (Hadoop catalog on a local volume first, then MinIO + REST catalog), partitioned by day, reading from `wiki.edits.clean`.
+- DuckDB queries via the `iceberg` extension. Inspect the raw Parquet and metadata files to see what Iceberg adds.
+- Add Wikimedia's event UUID (`meta.id`) to the producer contract. Deduplicate at query time, then try upserts.
+- Topics: checkpoint-driven commits, partitioning, small files and compaction, schema evolution, time travel.
+- Known risks: Hadoop classpath for Flink, absolute paths in Iceberg metadata when reading from the host.
+
+### Phase 3 — Real-time analytics & failure modes
+- Event time and watermarks. Tumbling windows (edits per wiki per minute). Bot ratio.
+- Sliding-window Top-N (append-only) vs all-time Top-N (changelog → `upsert-kafka`).
+- Spike detection (> N edits / page / minute).
+- Failure experiments: TaskManager kill with and without checkpoints, producer outage, late data, idle partitions, broker restart.
+
+## 7. Risks & mitigations (phase 1)
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Docker Desktop install/licensing friction | Blocks M0 | Personal use is free. OrbStack or Colima are drop-in fallbacks with the same CLI |
-| Flink ↔ connector version mismatch | Source table fails to load | Versions pinned together (`3.3.0-1.20` ↔ `1.20.1`) and documented |
-| Wikimedia blocks or throttles the client | No data | Descriptive User-Agent, single connection, backoff. Fall back to replaying a captured sample file |
-| Watermarks don't advance (idle partitions) | Windowed jobs emit nothing, confusing | `table.exec.source.idle-timeout` documented in troubleshooting |
-| Laptop memory pressure | Containers OOM | Explicit Flink memory settings. Docker memory ≥ 6 GB |
-| Scope creep | Core not finished in 2 h | Stretch work explicitly gated behind M4 |
+| Docker Desktop install / first image pulls slow | Eats the timebox | Install first. Images total ~1.5 GB |
+| Kafka listener misconfiguration | Clients connect then hang | Two listeners documented. First thing to check in troubleshooting |
+| Flink ↔ connector version mismatch | Source table fails to load | Versions pinned together (`3.3.0-1.20` ↔ `1.20.1`) |
+| Wikimedia blocks or throttles the client | No data | Descriptive User-Agent, single connection, backoff |
+| Scope creep into phase 2/3 | Phase 1 not finished | Non-goals listed explicitly above |
 
-## 12. Open questions
+## 8. Open questions
 
-- Should results be shown in a small live dashboard, or is the terminal/Kafka UI enough? (Currently stretch.)
-- Keep Flink 1.20 LTS, or move to Flink 2.x once the core works, as a migration exercise?
-- Is it worth adding Schema Registry + Avro to learn schema evolution, or stay with JSON?
+- Phase 2: start with a Hadoop catalog on local disk, or go straight to MinIO + REST catalog?
+- Phase 2: should Flink filter out Wikidata bot edits before storage to cut volume?
+- Phase 3: is a small live dashboard worth it, or are the terminal and Kafka UI enough?
