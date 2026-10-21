@@ -4,7 +4,7 @@
 
 This README is a **hands-on tutorial**. Work through the labs in order. Each one introduces a few concepts, has you run real commands, and ends with questions to check you understood. Reference material (exact configs, data contracts, design decisions) is in [`docs/TECHNICAL_DESIGN.md`](docs/TECHNICAL_DESIGN.md). Goals and phases are in [`docs/PRD.md`](docs/PRD.md).
 
-> **Status:** Phase 1. The stack hasn't been run end to end yet. If a command doesn't behave as described, that's a bug in the lab, so please fix it or open an issue.
+> **Status:** Phase 1, verified end to end on 2026-10-20 (Docker Desktop 4.96, Apple Silicon). If a command doesn't behave as described, that's a bug in the lab, so please fix it or open an issue.
 
 ---
 
@@ -46,6 +46,7 @@ By the end you'll be able to:
 | [1](#lab-1--start-the-stack-and-see-the-data) | Start the stack & see the data | 15 min | Compose up, the producer, topics, partitions, keys |
 | [2](#lab-2--query-the-live-stream-with-flink-sql) | Query the live stream with Flink SQL | 15 min | dynamic tables, JobManager/TaskManager, append vs update |
 | [3](#lab-3--your-first-pipeline-job) | Your first pipeline job | 10 min | source → transform → sink, detached jobs, consumer groups |
+| [3b](#lab-3b--query-the-raw-and-clean-data) | Query the raw and clean data | 10 min | Kafka UI, CLI + jq, streaming vs bounded SQL queries |
 | [4](#lab-4--clean-up) | Clean up | 2 min | teardown |
 
 Sections marked **(optional)** deepen understanding but aren't required to finish within 60 minutes.
@@ -92,9 +93,10 @@ $ docker compose version  # Compose v2 is built in
 
 ### 0.2 Start the downloads now
 
-The first build downloads ~1.5 GB of images. Run these in a second terminal and continue with the basics while they finish:
+The first build downloads ~1.5 GB of images. Run these in a second terminal and continue with the basics while they finish. Compose commands must run **from the repo folder**, because that's where it looks for `docker-compose.yml` (otherwise: `no configuration file provided`).
 
 ```sh
+$ cd ~/wiki-stream-lab                   # wherever you cloned it
 $ docker compose pull kafka kafka-ui     # pre-fetch published images
 $ docker compose build                   # build our two images (producer, flink)
 ```
@@ -201,7 +203,9 @@ Open [`producer/producer.py`](producer/producer.py):
 - `stream_events()` reads SSE lines and remembers the last `id`, so it can **resume** after a disconnect (`Last-Event-ID`).
 - `trim()` flattens each big upstream event into ~12 fields. This is the **data contract** ([TECHNICAL_DESIGN §4.2](docs/TECHNICAL_DESIGN.md#42-topic-wikirecentchange-raw)).
 - `producer.produce(..., key=event["wiki"])` is the key choice you just saw in Kafka UI.
-- Config: `acks=all` (wait for a durable write), `linger.ms=50` (batch messages for 50 ms), `compression.type=lz4`.
+- Config: `acks=all` (wait for a durable write), `linger.ms=50` (batch messages for 50 ms), `compression.type=lz4`, and `partitioner=murmur2_random`.
+
+💡 **Real gotcha found while building this lab:** the Python client (librdkafka) hashes keys with CRC32 by default, while Java clients, including Flink, use murmur2. Without `partitioner=murmur2_random`, `commonswiki` landed on partition 0 in the raw topic and partition 2 in Flink's output topic. "Same key → same partition" only holds when every client uses the same hash function.
 
 Then look at [`producer/Dockerfile`](producer/Dockerfile): base image → install deps → copy code → command. `requirements.txt` is copied *before* the code, so editing `producer.py` reuses the cached `pip install` layer.
 
@@ -384,6 +388,8 @@ WHERE `type` IN ('edit', 'new');
 2. **Kafka UI** → Topics → `wiki.edits.clean` → Messages: cleaned records with `event_ts`, `user_name`, `byte_delta`, keyed by wiki.
 3. **Kafka UI** → Consumers → `flink-wiki`: the job's committed offsets and lag on `wiki.recentchange`.
 
+✅ Lag shows a few hundred messages and drops after each checkpoint. That's expected: Flink commits offsets **only on checkpoints** (every 30 s), so the committed position trails the real one by up to 30 s of data (~800 events). The consumer-groups CLI also shows no `CONSUMER-ID`, because Flink assigns partitions itself instead of joining the group like a normal consumer. The group is only used to store offsets.
+
 From the CLI:
 
 ```sh
@@ -394,22 +400,123 @@ $ docker compose exec jobmanager ./bin/flink list
 
 💡 **You just built a pipeline stage.** Raw topic → stateless transform → clean topic is the most common streaming pattern. Downstream systems now consume a stable, cleaned contract ([TECHNICAL_DESIGN §4.3](docs/TECHNICAL_DESIGN.md#43-topic-wikieditsclean-flink-output)) instead of raw upstream data. In phase 2, an Iceberg sink will read from `wiki.edits.clean`.
 
+💡 **Stream vs batch transformation.** Transforming in Flink isn't the only option. Many teams land raw Kafka data in a data lake and clean it later with batch tools (Glue, Spark, dbt): simpler and cheaper, but minutes to hours stale. Streaming transforms like this one are used where seconds matter, and most companies run both. See [TECHNICAL_DESIGN: Where to transform](docs/TECHNICAL_DESIGN.md#where-to-transform-two-industry-patterns).
+
 ### 3.5 Save your SQL (optional)
 
-Put the `CREATE TABLE recentchange …` statement in `sql/01_source.sql`, and the rest of this lab in `sql/02_clean_edits.sql`. Next time:
+The statements from this tutorial are already saved in [`sql/01_source.sql`](sql/01_source.sql) and [`sql/02_clean_edits.sql`](sql/02_clean_edits.sql). Next time:
 
 ```sh
+# interactive session with the source table preloaded
 $ docker compose exec jobmanager ./bin/sql-client.sh -i /opt/sql/01_source.sql
+
+# or submit the whole job non-interactively
+$ docker compose exec jobmanager ./bin/sql-client.sh -i /opt/sql/01_source.sql -f /opt/sql/02_clean_edits.sql
 ```
+
+⚠️ In SQL files, put comments on their own line. The client only ends a statement at a `;` that ends the line, so `SET ...;  -- comment` merges with the next statement and fails with `only single statement supported`.
 
 (`./sql` on your Mac is bind-mounted to `/opt/sql` in the container, so there's no rebuild.)
 
 🧠 **Check yourself**
-1. Why did `INSERT INTO` return immediately while `SELECT` kept your terminal busy?
-2. What would happen to `wiki.edits.clean` if you stopped the producer? And if you cancelled the job?
-3. Why does consumer group `flink-wiki` only show offsets after checkpointing is enabled?
+1. Why keep both a raw and a clean topic, instead of cleaning inside the producer?
+2. Why did `INSERT INTO` return immediately while `SELECT` kept your terminal busy?
+3. What would happen to `wiki.edits.clean` if you stopped the producer? And if you cancelled the job?
+4. Why does consumer group `flink-wiki` only show offsets after checkpointing is enabled?
 
 🏋️ **Challenge (optional):** cancel the job (`./bin/flink cancel <job-id>`), add a filter that drops Wikidata bot edits (`NOT (wiki = 'wikidatawiki' AND bot)`), and resubmit. Compare message rates in Kafka UI.
+
+---
+
+## Lab 3b — Query the raw and clean data
+
+**Goal:** ask questions of both topics. There are three ways to do it, depending on how much power you need.
+
+### Option 1: Kafka UI (browse)
+
+http://localhost:8080 → Topics → `wiki.recentchange` or `wiki.edits.clean` → **Messages**. Pick a partition, seek to an offset or timestamp, or filter (e.g. *contains* `enwiki`). Good for eyeballing records. You can't aggregate here.
+
+### Option 2: Kafka CLI + `jq` (quick filters from your terminal)
+
+```sh
+# 5 latest raw events
+$ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+    --topic wiki.recentchange --max-messages 5
+
+# human English Wikipedia edits from the clean topic, selected fields
+$ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+    --topic wiki.edits.clean --max-messages 200 \
+  | jq -c 'select(.wiki=="enwiki" and (.is_bot|not)) | {event_ts, title, user_name, byte_delta}'
+```
+
+Add `--from-beginning` to read from the oldest retained message (up to 24 h) instead of new ones only.
+
+### Option 3: Flink SQL (real queries)
+
+```sh
+$ ./sql-shell.sh
+```
+
+[`sql-shell.sh`](sql-shell.sh) opens the SQL client with two tables preloaded:
+
+| Table | Topic | Reads from |
+|---|---|---|
+| `recentchange` | `wiki.recentchange` (raw) | new messages only (`latest-offset`) |
+| `edits_clean_read` | `wiki.edits.clean` (clean) | the beginning of the topic (`earliest-offset`) |
+
+(`sql-client.sh` accepts only one `-i` file, so the wrapper concatenates [`sql/01_source.sql`](sql/01_source.sql) and [`sql/03_clean_source.sql`](sql/03_clean_source.sql) inside the container.)
+
+```sql
+Flink SQL> SET 'sql-client.execution.result-mode' = 'tableau';
+```
+
+**Streaming queries** never finish. Results keep updating until you press `Ctrl-C`:
+
+```sql
+-- live raw events
+Flink SQL> SELECT event_ts, wiki, `type`, title FROM recentchange;
+
+-- live human edits on English Wikipedia from the clean topic
+Flink SQL> SELECT event_ts, title, user_name, byte_delta
+           FROM edits_clean_read WHERE wiki = 'enwiki' AND NOT is_bot;
+```
+
+**Bounded queries** read up to "now", then stop and return a final answer, like a normal database query. Two settings make that happen:
+
+```sql
+Flink SQL> SET 'execution.runtime-mode' = 'batch';
+
+-- busiest wikis in the clean topic so far, with bot share
+Flink SQL> SELECT wiki, COUNT(*) AS edits, SUM(CASE WHEN is_bot THEN 1 ELSE 0 END) AS bot_edits
+           FROM edits_clean_read /*+ OPTIONS('scan.bounded.mode'='latest-offset') */
+           GROUP BY wiki ORDER BY edits DESC LIMIT 10;
+
+-- biggest human additions on enwiki
+Flink SQL> SELECT event_ts, title, user_name, byte_delta
+           FROM edits_clean_read /*+ OPTIONS('scan.bounded.mode'='latest-offset') */
+           WHERE wiki = 'enwiki' AND NOT is_bot
+           ORDER BY byte_delta DESC LIMIT 10;
+
+-- event types in the RAW topic (override its startup mode and group just for this query)
+Flink SQL> SELECT `type`, COUNT(*) AS n
+           FROM recentchange /*+ OPTIONS('scan.startup.mode'='earliest-offset',
+                                         'scan.bounded.mode'='latest-offset',
+                                         'properties.group.id'='adhoc-query') */
+           GROUP BY `type`;
+
+Flink SQL> SET 'execution.runtime-mode' = 'streaming';   -- back to live mode
+```
+
+💡 **Same SQL, two modes.** `scan.bounded.mode = latest-offset` tells the Kafka source to stop at the offsets that exist when the query starts, which makes the input *finite*. In **batch** mode Flink then computes the final result once, instead of streaming `+I/-U/+U` updates. `ORDER BY` on a non-time column and `LIMIT` are natural here. The `/*+ OPTIONS(...) */` **hint** overrides table options for one query without changing the table definition.
+
+💡 **Why does the clean table have its own `group.id` (`adhoc-query`)?** Offsets are stored per consumer group. Ad-hoc queries use a separate group so they never move the committed offsets of the `clean_edits` job (`flink-wiki`).
+
+✅ Example from the first run: `commonswiki` was the busiest wiki in the clean topic (9,330 edits, about half by bots), ahead of `enwiki` (3,186). In the raw topic, `categorize` events (29,567) outnumbered `edit` (19,165).
+
+🧠 **Check yourself**
+1. Why does the `GROUP BY` query return a final table in batch mode, but `-U/+U` updates in streaming mode?
+2. What would go wrong if the ad-hoc table used `properties.group.id = 'flink-wiki'`?
+3. These queries scan Kafka every time and only see 24 h of data. What does that tell you about using Kafka as your analytics store? (This is what phase 2 fixes.)
 
 ---
 

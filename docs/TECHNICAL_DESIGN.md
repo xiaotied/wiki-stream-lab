@@ -2,13 +2,13 @@
 
 Laptop-scale real-time pipeline: **live Wikipedia edits → Apache Kafka → Apache Flink SQL**, all in Docker. This document is the reference for how it's built. For a guided walkthrough see the tutorial in [`README.md`](../README.md). For scope and phases see [`PRD.md`](PRD.md).
 
-> **Status:** Phase 1. The Compose stack and producer are written but have **not yet been run end to end**. The Flink SQL in §6 is the design for phase 1 and isn't committed to `sql/` yet.
+> **Status:** Phase 1, verified end to end on 2026-10-20 (Docker Desktop 4.96 / Engine 29.9, Apple Silicon). The SQL in §6 is committed in `sql/`. Observed numbers are in §6.4.
 
 ---
 
 ## Contents
 
-1. [Architecture](#1-architecture)
+1. [Architecture](#1-architecture) (incl. why two topics, and batch vs stream transformation)
 2. [Components & versions](#2-components--versions)
 3. [Repository layout](#3-repository-layout)
 4. [Data contracts](#4-data-contracts)
@@ -66,6 +66,54 @@ producer → wiki.recentchange → [clean_edits] → wiki.edits.clean ─┬─�
 
 Keeping `wiki.edits.clean` as a stable intermediate topic means later phases add consumers without touching ingestion.
 
+### Why two topics
+
+Each topic is the output of one pipeline stage:
+
+| Topic | Layer | Holds |
+|---|---|---|
+| `wiki.recentchange` | raw (≈ bronze) | Everything the source sent, minimally trimmed, nothing dropped |
+| `wiki.edits.clean` | cleaned (≈ silver) | Only `edit`/`new`, typed and renamed fields, derived `byte_delta` |
+
+Reasons to keep them separate:
+
+- **Replay:** if the cleaning logic is wrong, or you later need dropped events, fix the job and reprocess from the raw topic (within its 24 h retention). Cleaning inside the producer would lose that data for good.
+- **Stable contract:** downstream readers depend on `wiki.edits.clean`, not on Wikimedia's format. Upstream changes are absorbed in one place (`clean_edits`).
+- **Separation of concerns:** the producer only ingests and Flink only transforms. Each can change, restart or scale independently.
+- **Fan-out:** many consumers read the cleaned topic, each with its own offsets, instead of each repeating the same cleanup.
+
+Cost: the data is stored twice, plus one extra hop of latency (milliseconds) and one more running component.
+
+### Where to transform: two industry patterns
+
+There are two common places to turn raw events into clean data. This project uses **B**, because the goal is to learn Flink. **A** is just as valid and often the default.
+
+**A. Land raw, transform in the lake (ELT)**
+
+```
+Kafka (raw) ──▶ object storage, raw/bronze ──▶ batch ETL (Glue, Spark, dbt), hourly or daily ──▶ silver / gold tables
+               (Kafka Connect S3 sink, Firehose, or Flink)
+```
+
+**B. Transform in the stream**
+
+```
+Kafka (raw) ──▶ Flink ──▶ Kafka (clean) ──▶ lake, applications, alerts
+```
+
+| | A: transform in the lake | B: transform in the stream |
+|---|---|---|
+| Freshness of clean data | Minutes to hours (batch schedule) | Seconds |
+| Typical tools | Kafka Connect / Firehose + Glue, Spark, dbt | Flink, Kafka Streams |
+| Skills | Batch SQL / Spark: familiar to most data teams | Streaming: state, checkpoints, event time |
+| Reprocessing | Rerun a batch over raw files, kept for years | Replay from Kafka, only within retention |
+| Cost / operations | Cheaper: jobs run and stop | Always-on cluster |
+| Best for | Analytics, BI, ML training | Fraud detection, alerting, live metrics, feeding operational systems |
+
+**In practice, most companies combine them.** Raw data always lands in the lake as the long-term source of truth. Batch ETL builds analytical tables wherever hourly or daily freshness is enough, which is most cases. Stream processing is reserved for the paths where seconds matter. Rule of thumb: **use batch unless you need it real-time.**
+
+How this maps to the roadmap: phase 1 implements B up to the clean topic. Phase 2 lands data in Iceberg, which is where A's raw layer would live if the project adopts it.
+
 ---
 
 ## 2. Components & versions
@@ -98,6 +146,10 @@ wiki-stream-lab/
 │   ├── requirements.txt
 │   └── producer.py           # SSE → Kafka
 ├── sql/                      # Flink SQL scripts; bind-mounted to /opt/sql in the JobManager
+│   ├── 01_source.sql         # raw source table `recentchange`
+│   ├── 02_clean_edits.sql    # job clean_edits: raw → wiki.edits.clean
+│   └── 03_clean_source.sql   # read-side table `edits_clean_read` for ad-hoc queries
+├── sql-shell.sh              # opens the SQL client with several sql/ files preloaded
 ├── docs/
 │   ├── PRD.md                # product requirements and phases
 │   └── TECHNICAL_DESIGN.md   # this document
@@ -134,7 +186,7 @@ Written by the producer (`producer.py:trim`). Key = `wiki` (UTF-8 string). Value
 | `minor` | boolean \| null | `minor` | Edits only |
 | `length_old` | int \| null | `length.old` | Bytes before change (null for new pages) |
 | `length_new` | int \| null | `length.new` | Bytes after change |
-| `event_time` | string | `meta.dt` | ISO-8601 UTC, e.g. `2026-10-20T12:34:56Z` |
+| `event_time` | string | `meta.dt` | ISO-8601 UTC, usually with millis: `2026-10-21T02:11:17.687Z`, sometimes without |
 
 Example:
 
@@ -150,7 +202,7 @@ Written by Flink job `clean_edits`. Only `type IN ('edit', 'new')`. Key = `wiki`
 
 | Field | Type | Derivation |
 |---|---|---|
-| `event_ts` | timestamp, ISO-8601 | parsed from `event_time` |
+| `event_ts` | string, ISO-8601 **without zone** (`2026-10-21T02:12:48.171`) | parsed from `event_time`. The value is UTC, but Flink's `TIMESTAMP(3)` carries no zone, so the `Z` is dropped |
 | `wiki` | string | as is |
 | `server_name` | string | as is |
 | `title` | string | as is |
@@ -202,6 +254,7 @@ Both are auto-created on first write with the broker defaults (`KAFKA_NUM_PARTIT
 | `acks` | `all` | Leader waits for all in-sync replicas (one here) |
 | `linger.ms` | 50 | Batch for up to 50 ms → fewer, larger requests |
 | `compression.type` | `lz4` | Cheap CPU, good ratio on JSON |
+| `partitioner` | `murmur2_random` | librdkafka defaults to CRC32 key hashing, while Java clients (incl. Flink's sink) use murmur2. Matching them keeps a key on the same partition number in both topics (observed mismatch before the fix: `commonswiki` p0 raw vs p2 clean) |
 | delivery callback | logs failures | Visible in `docker compose logs producer` |
 
 Delivery is **at-least-once**: on reconnect, events near the `Last-Event-ID` boundary may be re-sent. Idempotence is off.
@@ -223,7 +276,7 @@ Set via `FLINK_PROPERTIES` in `docker-compose.yml` (shared by both Flink service
 | `jobmanager.memory.process.size` | 1024m | |
 | `state.checkpoints.dir` | `file:///opt/flink/checkpoints` | Shared `flink-checkpoints` volume |
 
-### 6.2 Source table (`sql/01_source.sql`, planned)
+### 6.2 Source table ([`sql/01_source.sql`](../sql/01_source.sql))
 
 ```sql
 CREATE TABLE recentchange (
@@ -239,7 +292,7 @@ CREATE TABLE recentchange (
   length_old  INT,
   length_new  INT,
   event_time  STRING,
-  -- '2026-10-20T12:34:56Z' -> TIMESTAMP(3)
+  -- '2026-10-21T02:11:17.687Z' -> TIMESTAMP(3); also handles values without millis
   event_ts AS TO_TIMESTAMP(REPLACE(REPLACE(event_time, 'T', ' '), 'Z', ''))
 ) WITH (
   'connector' = 'kafka',
@@ -254,7 +307,7 @@ CREATE TABLE recentchange (
 
 There's no `WATERMARK` in phase 1, because nothing depends on event-time progress yet. Phase 3 adds `WATERMARK FOR event_ts AS event_ts - INTERVAL '5' SECOND`.
 
-### 6.3 Sink table + job `clean_edits` (`sql/02_clean_edits.sql`, planned)
+### 6.3 Sink table + job `clean_edits` ([`sql/02_clean_edits.sql`](../sql/02_clean_edits.sql))
 
 ```sql
 SET 'execution.checkpointing.interval' = '30s';
@@ -304,7 +357,21 @@ Design notes:
 - **Stateless job:** filter + projection only. No windows or state, so the output is an append-only stream.
 - **Checkpointing (30 s)** is on so the Kafka source commits offsets to group `flink-wiki`, which makes consumer lag visible in Kafka UI. The Kafka sink's default delivery guarantee is at-least-once (it flushes on checkpoint).
 - **Ad-hoc queries** (`SELECT … FROM recentchange`) run in the SQL client session and stop when you cancel them. `INSERT INTO` submits a detached job that keeps running in the cluster.
-- **Loading files:** `./bin/sql-client.sh -i /opt/sql/01_source.sql` runs DDL at startup. The SQL client has no `SOURCE` command.
+- **Loading files:** `-i <file>` runs DDL at startup, and `-f <file>` executes a script and exits (used to submit the job: `./bin/sql-client.sh -i /opt/sql/01_source.sql -f /opt/sql/02_clean_edits.sql`). The SQL client has no `SOURCE` command.
+- **Statement splitting:** the client only ends a statement at a `;` that ends the line. A trailing comment after `;` merges two statements (`only single statement supported`), so comments go on their own lines.
+- **Ad-hoc querying:** `sql/03_clean_source.sql` defines `edits_clean_read` with its own group (`adhoc-query`) and `earliest-offset`, so queries never move the job's committed offsets. Bounded queries add `/*+ OPTIONS('scan.bounded.mode'='latest-offset') */` and run with `SET 'execution.runtime-mode' = 'batch';` to return final results. `sql-client.sh` accepts a single `-i`, so `sql-shell.sh` concatenates files inside the container.
+- **Consumer group semantics:** Flink assigns partitions itself and uses `flink-wiki` only to store committed offsets. The group shows no members (`CONSUMER-ID -`), and lag only moves on checkpoints.
+
+### 6.4 Observed on first run (2026-10-20)
+
+| Metric | Value |
+|---|---|
+| Producer throughput | 22–30 events/s |
+| Share kept by `clean_edits` (`edit`/`new`) | ~42% of raw events. Sample of 2,000: 51% `categorize`, 37% `edit`, 8% `log`, 5% `new` |
+| Raw partition skew | p0 (holds `wikidatawiki`, `enwiki`) gets ~2–3× the others |
+| Committed lag for `flink-wiki` | a few hundred messages, resets every 30 s checkpoint |
+| Checkpoints | completing every 30 s, 0 failed |
+| Docker memory | ~2.6 GB total (TaskManager ~0.9 GB, JobManager ~0.8 GB, Kafka ~0.45 GB, Kafka UI ~0.45 GB, producer ~20 MB) |
 
 ---
 
@@ -353,6 +420,8 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-s
 docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group flink-wiki
 
 # Flink
+./sql-shell.sh                                   # SQL client with recentchange + edits_clean_read
+./sql-shell.sh 01_source.sql -f /opt/sql/02_clean_edits.sql   # (re)submit the clean_edits job
 docker compose exec jobmanager ./bin/sql-client.sh
 docker compose exec jobmanager ./bin/sql-client.sh -i /opt/sql/01_source.sql
 docker compose exec jobmanager ./bin/flink list
@@ -374,8 +443,12 @@ docker stats
 | Client connects then hangs / "node 1 (localhost…) could not be established" | Wrong listener for where the client runs | Containers use `kafka:29092`, the host uses `localhost:9092` (§5.2) |
 | `Could not find any factory for identifier 'kafka'` | Connector JAR missing | `docker compose build --no-cache jobmanager taskmanager` |
 | SQL parse error near `user` | `USER` is reserved | Quote as `` `user` `` |
+| `only single statement supported` when running `-f` | A comment after `;` on the same line merges two statements | Put comments on their own line |
+| `no configuration file provided: not found` | `docker compose` run outside the repo folder | `cd` into the repo first |
+| Same key on different partition numbers in raw vs clean topic | librdkafka CRC32 vs Java murmur2 key hashing | Producer sets `partitioner: murmur2_random` |
 | `SELECT` shows no rows | `latest-offset` + producer not running | Check producer logs; or set `'scan.startup.mode' = 'earliest-offset'` |
 | Consumer group `flink-wiki` missing / no lag shown | Offsets are only committed on checkpoints | `SET 'execution.checkpointing.interval' = '30s';` before `INSERT` |
+| `flink-wiki` has no members / `CONSUMER-ID -` | Expected: Flink assigns partitions itself | Nothing to fix |
 | Job stuck in `CREATED` | Not enough task slots | Lower parallelism or add slots |
 | Containers OOM-killed | Docker memory too low | Docker Desktop → Resources → Memory ≥ 6 GB |
 | Port in use (8080/8081/9092) | Another local service | Change the host side of `ports:` |
